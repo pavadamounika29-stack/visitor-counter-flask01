@@ -1,0 +1,40 @@
+# Manual workflow: push to Amazon ECR using GitHub OIDC - no stored AWS keys.
+#
+# Repository settings:
+#   Variables:  AWS_REGION, ECR_REPOSITORY, AWS_ROLE_ARN
+name: Push to Amazon ECR (OIDC)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write        # allow the job to request a GitHub OIDC token
+
+jobs:
+  ecr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Assume the AWS role with OIDC
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Who am I?
+        run: aws sts get-caller-identity
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:oidc-${{ github.run_number }}

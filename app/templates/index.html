@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Visitor Counter</title>
+  <style>
+    body { font-family: Arial, sans-serif; background: #0D233F; color: #fff;
+           display: flex; align-items: center; justify-content: center;
+           min-height: 100vh; margin: 0; }
+    .card { background: #153B60; padding: 40px 56px; border-radius: 12px; text-align: center; }
+    .count { font-size: 72px; font-weight: bold; color: #87DCD7; margin: 8px 0; }
+    .meta { color: #AAC3D7; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Visitor Counter</h1>
+    <p>This page has been visited</p>
+    <div class="count">{{ visits }}</div>
+    <p>times</p>
+    <p class="meta">version {{ version }} &middot; env {{ environment }} &middot; container {{ hostname }}</p>
+  </div>
+</body>
+</html>

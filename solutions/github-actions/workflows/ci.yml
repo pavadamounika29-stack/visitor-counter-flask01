@@ -1,0 +1,180 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "30 2 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/python-setup
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Lint
+        run: flake8 app tests integration wsgi.py
+
+      - name: Unit tests with coverage
+        run: |
+          mkdir -p reports
+          pytest --junitxml=reports/junit.xml \
+                 --cov=app --cov-report=xml:reports/coverage.xml --cov-fail-under=80
+
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: test-reports-py${{ matrix.python-version }}
+          path: reports/
+
+  integration:
+    name: Integration (real Redis)
+    needs: test
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/python-setup
+      - name: Integration tests
+        run: pytest integration -v
+        env:
+          REDIS_HOST: localhost
+          REDIS_PORT: "6379"
+
+  sonarcloud:
+    name: SonarCloud
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0          # full history for accurate new-code detection
+
+      - uses: ./.github/actions/python-setup
+
+      - name: Tests for the coverage report
+        run: |
+          mkdir -p reports
+          pytest --junitxml=reports/junit.xml --cov=app --cov-report=xml:reports/coverage.xml
+
+      - name: SonarCloud scan + Quality Gate
+        uses: SonarSource/sonarqube-scan-action@v8
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: https://sonarcloud.io
+        with:
+          args: >
+            -Dsonar.projectVersion=${{ github.run_number }}
+            -Dsonar.qualitygate.wait=true
+            -Dsonar.qualitygate.timeout=300
+
+  trivy-fs:
+    name: Trivy filesystem scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write    # upload results to the Security tab
+    env:
+      TRIVY_IMAGE: aquasec/trivy:0.75.0
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Trivy scan (SARIF for the Security tab)
+        run: |
+          docker run --rm -v "$PWD:/src" "$TRIVY_IMAGE" fs --quiet \
+            --scanners vuln,secret,misconfig --severity HIGH,CRITICAL \
+            --format sarif --output /src/trivy-fs.sarif /src
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: trivy-fs.sarif
+          category: trivy-fs
+
+      - name: Security gate (fail on HIGH/CRITICAL)
+        run: |
+          docker run --rm -v "$PWD:/src" "$TRIVY_IMAGE" fs --quiet \
+            --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --exit-code 1 /src
+
+  dependency-review:
+    name: Dependency review
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/dependency-review-action@v5
+        with:
+          fail-on-severity: high
+
+  docker-build:
+    name: Docker build check
+    needs: [integration, trivy-fs]
+    uses: ./.github/workflows/reusable-docker-build.yml
+    with:
+      image-name: visitor-counter
+      push: false
+
+  report:
+    name: CI report
+    needs: [test, integration, sonarcloud, trivy-fs, docker-build]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Write summary
+        run: |
+          {
+            echo "### CI result for \`${GITHUB_SHA::7}\`"
+            echo "| Job | Result |"
+            echo "|---|---|"
+            echo "| test (matrix) | ${{ needs.test.result }} |"
+            echo "| integration | ${{ needs.integration.result }} |"
+            echo "| sonarcloud | ${{ needs.sonarcloud.result }} |"
+            echo "| trivy-fs | ${{ needs.trivy-fs.result }} |"
+            echo "| docker-build | ${{ needs.docker-build.result }} |"
+            echo ""
+            echo "Image built: \`${{ needs.docker-build.outputs.image }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  notify:
+    name: Notify on failure
+    needs: [test, integration, sonarcloud, trivy-fs, docker-build]
+    # main failures, plus manual runs so the lab can test it from a branch
+    if: failure() && (github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send webhook notification
+        env:
+          WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+        run: |
+          curl -fsS -X POST -H "Content-Type: application/json" \
+            -d "{\"text\": \"CI FAILED on main: ${{ github.repository }} run ${{ github.run_number }} - ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}\"}" \
+            "$WEBHOOK_URL"

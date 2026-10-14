@@ -1,0 +1,80 @@
+# CD - on every push to main: build, scan and push to Docker Hub, then deploy
+# with Docker Compose on the self-hosted runner (the Ubuntu VM) after approval.
+#
+# Repository settings:
+#   Variables:   DOCKERHUB_USERNAME
+#   Secrets:     DOCKERHUB_TOKEN
+#   Environment: production (required reviewers, branch main), variable APP_URL
+name: CD
+
+on:
+  push:
+    branches: [main]
+    paths-ignore: ["**.md", "docs/**"]
+  workflow_dispatch:
+    inputs:
+      rollback-tag:
+        description: "Rollback: deploy this existing image tag instead of building (e.g. gha-41-1a2b3c4)"
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cd-production
+  cancel-in-progress: false      # never cancel a deployment half-way
+
+jobs:
+  build-push:
+    name: Build, scan and push
+    if: ${{ inputs.rollback-tag == '' }}
+    uses: ./.github/workflows/reusable-docker-build.yml
+    with:
+      image-name: visitor-counter
+      push: true
+    secrets:
+      DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+
+  deploy:
+    name: Deploy to production
+    needs: build-push
+    # run after a successful build, or for a manual rollback (build skipped)
+    if: ${{ !cancelled() && (needs.build-push.result == 'success' || inputs.rollback-tag != '') }}
+    runs-on: [self-hosted, linux, deploy]
+    environment:
+      name: production
+      url: ${{ vars.APP_URL }}
+    env:
+      IMAGE: ${{ inputs.rollback-tag != '' && format('{0}/visitor-counter:{1}', vars.DOCKERHUB_USERNAME, inputs.rollback-tag) || needs.build-push.outputs.image }}
+      APP_NAME: vc-gha
+      APP_PORT: "5001"
+      APP_ENV: production
+      DEPLOY_HOST: host.docker.internal
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Deploy with Docker Compose
+        run: |
+          echo "Deploying $IMAGE"
+          docker compose -p "$APP_NAME" pull web
+          docker compose -p "$APP_NAME" up -d --remove-orphans
+          docker compose -p "$APP_NAME" ps
+
+      - name: Health check
+        run: |
+          for i in $(seq 1 20); do
+            if curl -fsS "http://$DEPLOY_HOST:$APP_PORT/health"; then
+              echo; echo "Application is healthy"; exit 0
+            fi
+            sleep 3
+          done
+          echo "Health check FAILED"
+          docker compose -p "$APP_NAME" logs --tail 50
+          exit 1
+
+      - name: Deployment summary
+        if: always()
+        run: |
+          echo "### Deployed \`$IMAGE\` to production" >> "$GITHUB_STEP_SUMMARY"
+          echo "URL: ${{ vars.APP_URL }}" >> "$GITHUB_STEP_SUMMARY"

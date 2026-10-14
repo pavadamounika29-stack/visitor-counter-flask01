@@ -1,0 +1,287 @@
+// =====================================================================
+// Visitor Counter - production-style Jenkins pipeline (course capstone, v9)
+//
+// Checkout -> Build -> Lint | Unit Test + Coverage -> SonarCloud -> Trivy FS
+// -> Integration Test -> Docker Build -> Trivy Image -> Smoke Test -> Push
+// (Docker Hub or ECR) -> Approval -> Deploy (Docker Compose) -> Health Check
+//
+// Jenkins credentials:  github-pat, dockerhub-creds, sonarcloud-token, aws-ecr-creds
+// =====================================================================
+pipeline {
+    agent { label 'docker' }
+
+    options {
+        skipDefaultCheckout(true)
+        timestamps()
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+        timeout(time: 60, unit: 'MINUTES')
+        disableConcurrentBuilds()
+    }
+
+    parameters {
+        choice(name: 'REGISTRY', choices: ['dockerhub', 'ecr'],
+               description: 'Registry to push the image to')
+        booleanParam(name: 'RUN_SONAR', defaultValue: true,
+                     description: 'Run SonarCloud analysis and wait for the Quality Gate')
+        booleanParam(name: 'DEPLOY', defaultValue: true,
+                     description: 'Deploy with Docker Compose after approval')
+    }
+
+    environment {
+        APP_NAME       = 'visitor-counter'
+        DOCKERHUB_USER = 'YOUR_DOCKERHUB_USER'      // <-- change
+        AWS_ACCOUNT_ID = '123456789012'             // <-- change (ECR only)
+        AWS_REGION     = 'us-east-1'                // <-- change (ECR only)
+        TRIVY_IMAGE    = 'aquasec/trivy:0.75.0'
+        SONAR_SCANNER  = 'sonarsource/sonar-scanner-cli:12'
+        DEPLOY_NAME    = 'vc-jenkins'
+        DEPLOY_PORT    = '5000'
+        DEPLOY_HOST    = 'host.docker.internal'
+        VENV           = '.venv'
+        REPORT_DIR     = 'reports'
+        REDIS_IT       = "redis-it-${env.BUILD_NUMBER}"
+        SMOKE          = "smoke-${env.BUILD_NUMBER}"
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_SHORT = sh(script: 'git rev-parse --short HEAD',
+                                       returnStdout: true).trim()
+                    env.VERSION = "${env.BUILD_NUMBER}-${env.GIT_SHORT}"
+                    env.IMAGE_REPO = (params.REGISTRY == 'ecr') ?
+                        "${env.AWS_ACCOUNT_ID}.dkr.ecr.${env.AWS_REGION}.amazonaws.com/${env.APP_NAME}" :
+                        "${env.DOCKERHUB_USER}/${env.APP_NAME}"
+                }
+                echo "Image will be ${IMAGE_REPO}:${VERSION}"
+            }
+        }
+
+        stage('Build') {
+            steps {
+                retry(3) {
+                    sh '''
+                      python3 -m venv $VENV
+                      . $VENV/bin/activate
+                      pip install -q -r requirements-dev.txt
+                    '''
+                }
+            }
+        }
+
+        stage('Quality Checks') {
+            parallel {
+                stage('Lint') {
+                    steps {
+                        sh '. $VENV/bin/activate && flake8 app tests integration wsgi.py'
+                    }
+                }
+                stage('Unit Test + Coverage') {
+                    steps {
+                        sh '''
+                          . $VENV/bin/activate
+                          mkdir -p $REPORT_DIR
+                          pytest --junitxml=$REPORT_DIR/junit.xml \
+                                 --cov=app --cov-report=xml:$REPORT_DIR/coverage.xml \
+                                 --cov-fail-under=80
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('SonarCloud') {
+            // PR builds (CHANGE_ID set in multibranch jobs) are analysed by GitHub Actions instead
+            when { expression { params.RUN_SONAR && env.CHANGE_ID == null } }
+            steps {
+                withCredentials([string(credentialsId: 'sonarcloud-token', variable: 'SONAR_TOKEN')]) {
+                    sh '''
+                      docker run --rm \
+                        -e SONAR_TOKEN -e SONAR_HOST_URL=https://sonarcloud.io \
+                        -v "$WORKSPACE:/usr/src" \
+                        $SONAR_SCANNER \
+                        -Dsonar.projectVersion=$VERSION \
+                        -Dsonar.qualitygate.wait=true \
+                        -Dsonar.qualitygate.timeout=300
+                    '''
+                }
+            }
+        }
+
+        stage('Trivy FS Scan') {
+            steps {
+                sh '''
+                  mkdir -p $REPORT_DIR
+                  # 1) report (does not fail)
+                  docker run --rm -v "$WORKSPACE:/src" -v trivy-cache:/root/.cache/ \
+                    $TRIVY_IMAGE fs --quiet --scanners vuln,secret,misconfig \
+                    --skip-dirs /src/.venv --severity HIGH,CRITICAL /src \
+                    > $REPORT_DIR/trivy-fs.txt
+                  cat $REPORT_DIR/trivy-fs.txt
+                  # 2) gate: fail on any HIGH or CRITICAL finding
+                  docker run --rm -v "$WORKSPACE:/src" -v trivy-cache:/root/.cache/ \
+                    $TRIVY_IMAGE fs --quiet --scanners vuln,secret,misconfig \
+                    --skip-dirs /src/.venv --severity HIGH,CRITICAL --exit-code 1 /src
+                '''
+            }
+        }
+
+        stage('Integration Test') {
+            steps {
+                sh '''
+                  docker run -d --rm --name $REDIS_IT -p 16379:6379 redis:7-alpine
+                  for i in $(seq 1 20); do
+                    docker exec $REDIS_IT redis-cli ping | grep -q PONG && break
+                    sleep 1
+                  done
+                  . $VENV/bin/activate
+                  REDIS_HOST=host.docker.internal REDIS_PORT=16379 \
+                    pytest integration -v --junitxml=$REPORT_DIR/integration.xml
+                '''
+            }
+            post {
+                always { sh 'docker rm -f $REDIS_IT || true' }
+            }
+        }
+
+        stage('Docker Build') {
+            steps {
+                sh '''
+                  docker build \
+                    --build-arg APP_VERSION=$VERSION \
+                    --build-arg GIT_COMMIT=$GIT_COMMIT \
+                    -t $IMAGE_REPO:$VERSION -t $IMAGE_REPO:latest .
+                '''
+            }
+        }
+
+        stage('Trivy Image Scan') {
+            steps {
+                sh '''
+                  # report of fixable HIGH + CRITICAL vulnerabilities
+                  docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                    -v trivy-cache:/root/.cache/ $TRIVY_IMAGE image --quiet \
+                    --severity HIGH,CRITICAL --ignore-unfixed \
+                    $IMAGE_REPO:$VERSION > $REPORT_DIR/trivy-image.txt
+                  cat $REPORT_DIR/trivy-image.txt
+                  # software bill of materials (CycloneDX)
+                  docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                    -v trivy-cache:/root/.cache/ $TRIVY_IMAGE image --quiet \
+                    --format cyclonedx $IMAGE_REPO:$VERSION > $REPORT_DIR/sbom.cdx.json
+                  # gate: fail on any fixable CRITICAL vulnerability
+                  docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+                    -v trivy-cache:/root/.cache/ $TRIVY_IMAGE image --quiet \
+                    --severity CRITICAL --ignore-unfixed --exit-code 1 \
+                    $IMAGE_REPO:$VERSION
+                '''
+            }
+        }
+
+        stage('Image Smoke Test') {
+            steps {
+                sh '''
+                  docker run -d --rm --name $SMOKE -p 15000:5000 $IMAGE_REPO:$VERSION
+                  for i in $(seq 1 15); do
+                    curl -fsS http://$DEPLOY_HOST:15000/version && break
+                    sleep 2
+                  done
+                  echo
+                  curl -fsS http://$DEPLOY_HOST:15000/version | grep -F "$VERSION"
+                '''
+            }
+            post {
+                always { sh 'docker rm -f $SMOKE || true' }
+            }
+        }
+
+        stage('Push Image') {
+            // only main publishes images; feature branches and PRs stop after the gates
+            when { expression { env.BRANCH_NAME == null || env.BRANCH_NAME == 'main' } }
+            steps {
+                script {
+                    if (params.REGISTRY == 'ecr') {
+                        withCredentials([[$class: 'AmazonWebServicesCredentialsBinding',
+                                          credentialsId: 'aws-ecr-creds']]) {
+                            sh '''
+                              aws ecr get-login-password --region $AWS_REGION | \
+                                docker login --username AWS --password-stdin ${IMAGE_REPO%%/*}
+                              docker push $IMAGE_REPO:$VERSION
+                              docker push $IMAGE_REPO:latest
+                            '''
+                        }
+                    } else {
+                        withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
+                                                          usernameVariable: 'DH_USER',
+                                                          passwordVariable: 'DH_TOKEN')]) {
+                            sh '''
+                              echo "$DH_TOKEN" | docker login -u "$DH_USER" --password-stdin
+                              docker push $IMAGE_REPO:$VERSION
+                              docker push $IMAGE_REPO:latest
+                            '''
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Approval') {
+            when { expression { params.DEPLOY } }
+            steps {
+                timeout(time: 15, unit: 'MINUTES') {
+                    input message: "Deploy ${env.IMAGE_REPO}:${env.VERSION} to production?",
+                          ok: 'Deploy', submitter: 'admin'
+                }
+            }
+        }
+
+        stage('Deploy') {
+            when { expression { params.DEPLOY } }
+            steps {
+                sh '''
+                  export IMAGE=$IMAGE_REPO:$VERSION
+                  export APP_NAME=$DEPLOY_NAME APP_PORT=$DEPLOY_PORT APP_ENV=production
+                  docker compose -p $DEPLOY_NAME up -d --remove-orphans
+                  docker compose -p $DEPLOY_NAME ps
+                '''
+            }
+        }
+
+        stage('Health Check') {
+            when { expression { params.DEPLOY } }
+            steps {
+                sh '''
+                  for i in $(seq 1 20); do
+                    if curl -fsS http://$DEPLOY_HOST:$DEPLOY_PORT/health; then
+                      echo; echo "Application is healthy"; exit 0
+                    fi
+                    sleep 3
+                  done
+                  echo "Health check FAILED"
+                  docker compose -p $DEPLOY_NAME logs --tail 50
+                  exit 1
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            junit allowEmptyResults: true, testResults: 'reports/*.xml'
+            recordCoverage(tools: [[parser: 'COBERTURA', pattern: 'reports/coverage.xml']])
+            archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
+            sh 'docker logout || true'
+        }
+        success { echo "Delivered ${env.IMAGE_REPO}:${env.VERSION}" }
+        failure {
+            withCredentials([string(credentialsId: 'notify-webhook-url', variable: 'WEBHOOK_URL')]) {
+                sh '''
+                  curl -fsS -X POST -H "Content-Type: application/json" \
+                    -d "{\\"text\\": \\"Jenkins FAILED: $JOB_NAME #$BUILD_NUMBER - $BUILD_URL\\"}" \
+                    "$WEBHOOK_URL"
+                '''
+            }
+        }
+    }
+}

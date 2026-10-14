@@ -1,0 +1,48 @@
+# Manual workflow: build the image and push it to Amazon ECR (access keys).
+#
+# Repository settings:
+#   Variables:  AWS_REGION, ECR_REPOSITORY (visitor-counter)
+#   Secrets:    AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
+name: Push to Amazon ECR
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ecr:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:${{ github.run_number }}-${{ github.sha }}
+            ${{ steps.ecr.outputs.registry }}/${{ vars.ECR_REPOSITORY }}:latest
+          build-args: |
+            APP_VERSION=${{ github.run_number }}
+            GIT_COMMIT=${{ github.sha }}
+
+      - name: Show the newest image tags
+        run: |
+          aws ecr describe-images --repository-name "${{ vars.ECR_REPOSITORY }}" \
+            --query 'sort_by(imageDetails,&imagePushedAt)[-1].imageTags' --output text
